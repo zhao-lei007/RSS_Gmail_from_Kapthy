@@ -1,7 +1,17 @@
+/**
+ * RSS to Gmail - 并发优化版 (2026-02-09)
+ *
+ * 优化重点：
+ * 1. RSS 抓取改为并发 fetchAll，单次运行可扫完整个订阅列表。
+ * 2. Gemini 摘要改为并发批量调用，并保留串行降级兜底。
+ * 3. 新增时间预算、安全缓冲、锁机制，避免 6 分钟硬超时和重入。
+ */
+
 // ==================== 配置区域 ====================
 const CONFIG = {
-    EMAIL: '你的 Gmail 地址',
-    GEMINI_API_KEY: '你的 API key', // 已保留你的 Key
+    SCRIPT_VERSION: '2026-02-09.6',
+    EMAIL: 'zhaolei28007@gmail.com',
+    GEMINI_API_KEY: 'AIzaSyDUzzdav4PZRms3KCwTN-vod1DsOqHd9wM', // 已保留你的 Key
     // 使用更稳定的 Flash 模型版本
     GEMINI_API_ENDPOINT: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent',
 
@@ -12,15 +22,26 @@ const CONFIG = {
     HOURS_TO_FETCH: 24,
 
     // 性能优化参数
-    BATCH_SIZE: 15,
     MAX_EMAILS_PER_BATCH: 10,
-    EMAIL_DELAY: 500,
+    EMAIL_DELAY: 100,
+    FEED_FETCH_BATCH_SIZE: 20,
+    FEED_TIMEOUT: 7000,
+    MAX_ITEMS_PER_FEED: 6,
+    GEMINI_BATCH_SIZE: 4,
+    MAX_PROMPT_CHARS: 2800,
+    MIN_SUMMARY_CHARS: 180,
+    SENT_URL_LOOKBACK: 2000,
 
-    API_RETRY_COUNT: 1,
-    API_TIMEOUT: 20000, // 延长超时时间
+    API_RETRY_COUNT: 2,
+    API_TIMEOUT: 12000,
     RETRY_DELAY: 1000,
+    GEMINI_MAX_OUTPUT_TOKENS: 1536,
 
-    MAX_EXECUTION_TIME: 300000,
+    // Apps Script 单次上限 6 分钟，预留 20 秒做收尾，避免被系统硬中断
+    MAX_EXECUTION_TIME: 360000,
+    SAFETY_BUFFER_MS: 20000,
+    RESERVED_TIME_FOR_GEMINI_MS: 40000,
+    RESERVED_TIME_FOR_EMAIL_MS: 20000,
 
     SUBJECT_PREFIX: '[RSS] ',
 };
@@ -125,79 +146,87 @@ const RSS_FEEDS = [
 
 function main() {
     const startTime = new Date().getTime();
-    console.log('========================================');
-    console.log('开始执行 RSS to Gmail（修复版 V2）');
-    console.log(`执行时间: ${new Date().toLocaleString('zh-CN')}`);
+    const lock = LockService.getScriptLock();
 
-    if (!CONFIG.GEMINI_API_KEY || CONFIG.GEMINI_API_KEY.includes('YOUR_GEMINI_API_KEY')) {
-        console.error('错误: 请先配置 GEMINI_API_KEY');
+    if (!lock.tryLock(5000)) {
+        console.warn('已有实例在运行，跳过本次触发');
         return;
     }
 
-    const sheet = getOrCreateSheet();
-    const stateSheet = getOrCreateStateSheet();
-    const sentUrls = getSentUrls(sheet);
-    const state = getProcessState(stateSheet);
+    console.log('========================================');
+    console.log('开始执行 RSS to Gmail（并发优化版）');
+    console.log(`脚本版本: ${CONFIG.SCRIPT_VERSION}`);
+    console.log(`执行时间: ${new Date().toLocaleString('zh-CN')}`);
 
-    console.log(`当前批次: ${state.currentBatch}/${state.totalBatches} (起始索引: ${state.currentIndex})`);
-
-    const startIdx = state.currentIndex;
-    const endIdx = Math.min(startIdx + CONFIG.BATCH_SIZE, RSS_FEEDS.length);
-    const feedsToProcess = RSS_FEEDS.slice(startIdx, endIdx);
-
-    const cutoffDate = new Date();
-    cutoffDate.setHours(cutoffDate.getHours() - CONFIG.HOURS_TO_FETCH);
-
-    const allArticles = [];
-
-    for (const feed of feedsToProcess) {
-        if (isTimeoutApproaching(startTime)) {
-            console.log('⚠️ 接近超时限制，提前停止');
-            break;
+    try {
+        if (!CONFIG.GEMINI_API_KEY || CONFIG.GEMINI_API_KEY.includes('YOUR_GEMINI_API_KEY')) {
+            console.error('错误: 请先配置 GEMINI_API_KEY');
+            return;
         }
-        try {
-            const articles = fetchFeed(feed, cutoffDate, sentUrls);
-            allArticles.push(...articles);
-            if (articles.length > 0) console.log(`✓ ${feed.name}: ${articles.length} 篇`);
-        } catch (error) {
-            console.error(`✗ ${feed.name}: ${error.message}`);
-        }
-    }
 
-    allArticles.sort((a, b) => b.pubDate - a.pubDate);
-    const articlesToSend = allArticles.slice(0, CONFIG.MAX_EMAILS_PER_BATCH);
+        const sheet = getOrCreateSheet();
+        const stateSheet = getOrCreateStateSheet();
+        const state = getProcessState(stateSheet);
+        const sentUrls = getSentUrls(sheet);
 
-    let sentCount = 0;
+        const cutoffDate = new Date();
+        cutoffDate.setHours(cutoffDate.getHours() - CONFIG.HOURS_TO_FETCH);
 
-    for (const article of articlesToSend) {
-        if (isTimeoutApproaching(startTime)) break;
+        const scanResult = fetchFeedsInParallel(RSS_FEEDS, cutoffDate, sentUrls, startTime);
+        const allArticles = scanResult.articles;
+        allArticles.sort((a, b) => b.pubDate - a.pubDate);
 
-        try {
-            const aiContent = generateAIContent(article);
-            if (aiContent) {
+        const articlesToSend = allArticles.slice(0, CONFIG.MAX_EMAILS_PER_BATCH);
+        const aiResults = generateAIContentBatch(articlesToSend, startTime);
+
+        let sentCount = 0;
+        let skippedCount = 0;
+        for (let i = 0; i < articlesToSend.length; i++) {
+            if (isTimeoutApproaching(startTime, CONFIG.RESERVED_TIME_FOR_EMAIL_MS / 2)) {
+                console.warn('⚠️ 接近超时，停止发送邮件');
+                break;
+            }
+
+            const article = articlesToSend[i];
+            let aiContent = aiResults[i];
+
+            if (!isAiContentComplete(aiContent) && !isTimeoutApproaching(startTime, CONFIG.RESERVED_TIME_FOR_EMAIL_MS / 2)) {
+                aiContent = generateAIContent(article);
+            }
+
+            if (!isAiContentComplete(aiContent)) {
+                skippedCount++;
+                console.warn(`⚠️ 摘要未完成，跳过发送: ${article.title}`);
+                continue;
+            }
+
+            try {
                 sendEnhancedArticleEmail(article, aiContent);
                 recordSentArticle(sheet, article, aiContent.titleZh);
                 sentCount++;
-                console.log(`✓ 已发送: ${article.title}`);
+                console.log(`✓ 已发送: ${article.title} | 摘要长度: ${aiContent.summaryZh.length}`);
+            } catch (error) {
+                console.error(`✗ 发送失败: ${error.message}`);
             }
+
             if (CONFIG.EMAIL_DELAY > 0) Utilities.sleep(CONFIG.EMAIL_DELAY);
-        } catch (error) {
-            console.error(`✗ 发送失败: ${error.message}`);
         }
+
+        updateProcessState(stateSheet, {
+            currentIndex: 0,
+            currentBatch: 1,
+            totalBatches: 1,
+            lastRunTime: new Date().toISOString(),
+            totalArticlesFound: state.totalArticlesFound + allArticles.length,
+            totalEmailsSent: state.totalEmailsSent + sentCount,
+        });
+
+        const elapsedTime = ((new Date().getTime() - startTime) / 1000).toFixed(2);
+        console.log(`完成 | 扫描源: ${scanResult.processedFeeds}/${RSS_FEEDS.length} | 新文章: ${allArticles.length} | 发送: ${sentCount} | 跳过: ${skippedCount} | 耗时: ${elapsedTime}秒`);
+        console.log('========================================');
+    } finally {
+        lock.releaseLock();
     }
-
-    const isComplete = endIdx >= RSS_FEEDS.length;
-    updateProcessState(stateSheet, {
-        currentIndex: isComplete ? 0 : endIdx,
-        currentBatch: isComplete ? 1 : state.currentBatch + 1,
-        lastRunTime: new Date().toISOString(),
-        totalArticlesFound: state.totalArticlesFound + allArticles.length,
-        totalEmailsSent: state.totalEmailsSent + sentCount,
-    });
-
-    const elapsedTime = ((new Date().getTime() - startTime) / 1000).toFixed(2);
-    console.log(`本批次完成 | 耗时: ${elapsedTime}秒 | 发送: ${sentCount}`);
-    console.log('========================================');
 }
 
 // ==================== Gemini API (核心修复) ====================
@@ -205,14 +234,14 @@ function main() {
 function sanitizeForAPI(text) {
     if (!text) return '';
     text = text.replace(/<[^>]*>/g, ' ');
-    return text.trim().substring(0, 5000);
+    return text.trim().substring(0, CONFIG.MAX_PROMPT_CHARS);
 }
 
-function generateAIContent(article) {
+function buildGeminiPrompt(article) {
     const cleanTitle = sanitizeForAPI(article.title);
     const cleanContent = sanitizeForAPI(article.content);
 
-    const prompt = `You are a helpful assistant. 
+    return `You are a helpful assistant. 
 Please analyze the following blog post and return a JSON object.
 
 Article Title: ${cleanTitle}
@@ -223,119 +252,393 @@ ${cleanContent}
 **Strict Requirement:**
 1. Output MUST be valid JSON format.
 2. "titleZh": Translate the title to Chinese.
-3. "summaryZh": Write a detailed summary (200-300 words) in Chinese.
-4. Do NOT use markdown. Just raw JSON.
+3. "summaryZh": Write a complete Chinese summary with 5-8 sentences, about 220-320 Chinese characters.
+4. summaryZh must end with a full sentence punctuation (。 or ！ or ？).
+5. Do NOT use markdown. Just raw JSON.
 
 **JSON Structure:**
 {
   "titleZh": "...",
   "summaryZh": "..."
 }`;
+}
+
+function buildGeminiRequest(article) {
+    const prompt = buildGeminiPrompt(article);
+    return {
+        url: `${CONFIG.GEMINI_API_ENDPOINT}?key=${CONFIG.GEMINI_API_KEY}`,
+        method: 'post',
+        contentType: 'application/json',
+        muteHttpExceptions: true,
+        timeout: CONFIG.API_TIMEOUT,
+        payload: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+                temperature: 0.3,
+                maxOutputTokens: CONFIG.GEMINI_MAX_OUTPUT_TOKENS,
+                responseMimeType: 'application/json'
+            }
+        })
+    };
+}
+
+function parseAIResult(rawText, article) {
+    if (!rawText) return null;
+
+    rawText = rawText.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();
+
+    try {
+        const parsed = JSON.parse(rawText);
+        return {
+            titleZh: parsed.titleZh || article.title,
+            summaryZh: (parsed.summaryZh || '').replace(/\*\*/g, '')
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+function parseGeminiResponse(response, article) {
+    if (!response) return null;
+    if (response.getResponseCode() !== 200) return null;
+
+    let result;
+    try {
+        result = JSON.parse(response.getContentText());
+    } catch (e) {
+        return null;
+    }
+
+    const finishReason = result?.candidates?.[0]?.finishReason || '';
+    if (finishReason === 'MAX_TOKENS' || finishReason === 'SAFETY') return null;
+
+    const rawText = result?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return parseAIResult(rawText, article);
+}
+
+function isAiContentComplete(aiContent) {
+    if (!aiContent || !aiContent.summaryZh) return false;
+
+    const summary = aiContent.summaryZh.trim();
+    if (!summary) return false;
+    if (summary.length < CONFIG.MIN_SUMMARY_CHARS) return false;
+    if (summary.indexOf('AI 摘要生成失败') >= 0) return false;
+    if ((aiContent.titleZh || '').indexOf('(处理中)') >= 0) return false;
+
+    // 优先要求自然句末；若内容足够长也允许通过，避免误判正常摘要
+    if (/[。！？.!?]$/.test(summary)) return true;
+    return summary.length >= (CONFIG.MIN_SUMMARY_CHARS + 80);
+}
+
+function generateAIContent(article) {
+    const request = buildGeminiRequest(article);
+    const requestUrl = request.url;
+    const requestOptions = Object.assign({}, request);
+    delete requestOptions.url;
 
     for (let attempt = 1; attempt <= CONFIG.API_RETRY_COUNT; attempt++) {
         try {
-            const response = UrlFetchApp.fetch(
-                `${CONFIG.GEMINI_API_ENDPOINT}?key=${CONFIG.GEMINI_API_KEY}`,
-                {
-                    method: 'post',
-                    contentType: 'application/json',
-                    muteHttpExceptions: true,
-                    timeout: CONFIG.API_TIMEOUT,
-                    payload: JSON.stringify({
-                        contents: [{ parts: [{ text: prompt }] }],
-                        generationConfig: {
-                            temperature: 0.3,
-                            maxOutputTokens: 8192, // ⚠️ 增加到 8k，防止生成中途截断
-                            responseMimeType: "application/json"
-                        }
-                    })
-                }
-            );
-
-            if (response.getResponseCode() !== 200) throw new Error(`API Error: ${response.getResponseCode()}`);
-
-            const result = JSON.parse(response.getContentText());
-            let rawText = result.candidates[0].content.parts[0].text.trim();
-
-            // 清理 Markdown
-            rawText = rawText.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();
-
-            try {
-                // 尝试标准解析
-                const parsed = JSON.parse(rawText);
-                return {
-                    titleZh: parsed.titleZh || article.title,
-                    summaryZh: (parsed.summaryZh || '').replace(/\*\*/g, '')
-                };
-            } catch (e) {
-                console.warn('JSON Parse 失败，尝试正则提取...');
-
-                // ⚠️ 正则强制提取：就算 JSON 烂了也能扣出内容
-                // 匹配 "summaryZh": "内容... 直到遇到引号或结束
-                const titleMatch = rawText.match(/"titleZh"\s*:\s*"([^"]*?)"/);
-                const summaryMatch = rawText.match(/"summaryZh"\s*:\s*"([\s\S]*?)(?:"\s*}|$)/);
-
-                let extractedTitle = titleMatch ? titleMatch[1] : null;
-                let extractedSummary = summaryMatch ? summaryMatch[1] : null;
-
-                if (extractedSummary) {
-                    return {
-                        titleZh: extractedTitle || article.title,
-                        summaryZh: extractedSummary // 提取到的部分内容
-                    };
-                }
-
-                // 最后的防线：如果连正则都匹配不到，说明彻底乱了
-                // 手动清理 JSON 符号，只留文字，防止显示代码
-                const cleanedText = rawText
-                    .replace(/["{}]/g, '')
-                    .replace(/titleZh:/g, '\n【标题】：')
-                    .replace(/summaryZh:/g, '\n【摘要】：')
-                    .trim();
-
-                return {
-                    titleZh: `${article.title} (处理中)`,
-                    summaryZh: cleanedText
-                };
-            }
-
+            const response = UrlFetchApp.fetch(requestUrl, requestOptions);
+            const parsed = parseGeminiResponse(response, article);
+            if (isAiContentComplete(parsed)) return parsed;
+            throw new Error(`API Error: ${response.getResponseCode()}`);
         } catch (error) {
             console.error(`API 尝试 ${attempt} 失败: ${error.message}`);
             if (attempt === CONFIG.API_RETRY_COUNT) {
-                return {
-                    titleZh: article.title,
-                    summaryZh: 'AI 摘要生成失败，请直接阅读原文。',
-                };
+                return null;
             }
             Utilities.sleep(CONFIG.RETRY_DELAY);
         }
     }
 }
 
+function generateAIContentBatch(articles, startTime) {
+    const results = new Array(articles.length).fill(null);
+    if (articles.length === 0) return results;
+
+    for (let i = 0; i < articles.length; i += CONFIG.GEMINI_BATCH_SIZE) {
+        if (isTimeoutApproaching(startTime, CONFIG.RESERVED_TIME_FOR_EMAIL_MS)) {
+            console.warn('⚠️ 为邮件发送预留时间，停止 Gemini 调用');
+            break;
+        }
+
+        const group = articles.slice(i, i + CONFIG.GEMINI_BATCH_SIZE);
+        const requests = group.map(buildGeminiRequest);
+
+        let responses = [];
+        try {
+            responses = UrlFetchApp.fetchAll(requests);
+        } catch (error) {
+            console.warn(`Gemini 并发请求失败，将降级串行: ${error.message}`);
+        }
+
+        for (let j = 0; j < group.length; j++) {
+            const article = group[j];
+            const idx = i + j;
+            const parsed = parseGeminiResponse(responses[j], article);
+            if (isAiContentComplete(parsed)) {
+                results[idx] = parsed;
+                continue;
+            }
+
+            if (isTimeoutApproaching(startTime, CONFIG.RESERVED_TIME_FOR_EMAIL_MS)) {
+                break;
+            }
+            const retried = generateAIContent(article);
+            if (isAiContentComplete(retried)) {
+                results[idx] = retried;
+            }
+        }
+    }
+
+    return results;
+}
+
 // ==================== RSS 解析 ====================
 
 function fetchFeed(feed, cutoffDate, sentUrls) {
+    const request = buildFeedRequest(feed);
+    const requestUrl = request.url;
+    const requestOptions = Object.assign({}, request);
+    delete requestOptions.url;
     try {
-        const response = UrlFetchApp.fetch(feed.url, {
-            muteHttpExceptions: true,
-            followRedirects: true,
-            timeout: 8000,
-        });
+        const response = UrlFetchApp.fetch(requestUrl, requestOptions);
         if (response.getResponseCode() !== 200) return [];
+        return parseFeedXml(response.getContentText(), feed, cutoffDate, sentUrls);
+    } catch (e) {
+        console.warn(`Feed 解析错误 ${feed.name}: ${e.message}`);
+        return [];
+    }
+}
 
-        const xml = response.getContentText();
+function fetchFeedsInParallel(feeds, cutoffDate, sentUrls, startTime) {
+    const articles = [];
+    let processedFeeds = 0;
+
+    for (let i = 0; i < feeds.length; i += CONFIG.FEED_FETCH_BATCH_SIZE) {
+        if (isTimeoutApproaching(startTime, CONFIG.RESERVED_TIME_FOR_GEMINI_MS)) {
+            console.warn('⚠️ 为 Gemini 摘要预留时间，停止继续抓取 RSS');
+            break;
+        }
+
+        const group = feeds.slice(i, i + CONFIG.FEED_FETCH_BATCH_SIZE);
+        const requests = group.map(buildFeedRequest);
+        const responses = fetchAllWithIsolation(requests, group.map(function (f) { return f.name; }), 'RSS');
+
+        for (let j = 0; j < group.length; j++) {
+            const feed = group[j];
+            const response = responses[j];
+            processedFeeds++;
+
+            if (!response || response.getResponseCode() !== 200) {
+                continue;
+            }
+
+            try {
+                const parsed = parseFeedXml(response.getContentText(), feed, cutoffDate, sentUrls);
+                articles.push(...parsed);
+                if (parsed.length > 0) console.log(`✓ ${feed.name}: ${parsed.length} 篇`);
+            } catch (e) {
+                console.warn(`Feed 解析错误 ${feed.name}: ${e.message}`);
+            }
+        }
+    }
+
+    return { articles: articles, processedFeeds: processedFeeds };
+}
+
+function buildFeedRequest(feed) {
+    return {
+        url: feed.url,
+        method: 'get',
+        muteHttpExceptions: true,
+        followRedirects: true,
+        timeout: CONFIG.FEED_TIMEOUT,
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; RSS2Gmail/1.0)'
+        }
+    };
+}
+
+function fetchAllWithIsolation(requests, labels, contextTag) {
+    if (requests.length === 0) return [];
+
+    try {
+        return UrlFetchApp.fetchAll(requests);
+    } catch (error) {
+        console.warn(contextTag + ' 批量请求失败，切换串行: ' + error.message);
+        const responses = [];
+
+        for (let i = 0; i < requests.length; i++) {
+            const req = requests[i];
+            const label = labels[i] || req.url || 'unknown';
+            const requestUrl = req.url;
+            const requestOptions = Object.assign({}, req);
+            delete requestOptions.url;
+
+            try {
+                responses.push(UrlFetchApp.fetch(requestUrl, requestOptions));
+            } catch (singleError) {
+                console.warn(contextTag + ' 请求失败 ' + label + ': ' + singleError.message);
+                responses.push(null);
+            }
+        }
+
+        return responses;
+    }
+}
+
+function parseFeedXml(xml, feed, cutoffDate, sentUrls) {
+    try {
         const doc = XmlService.parse(xml);
         const root = doc.getRootElement();
 
         if (root.getName().toLowerCase() === 'rss') {
             return parseRss(root, feed, cutoffDate, sentUrls);
-        } else {
-            return parseAtom(root, feed, cutoffDate, sentUrls);
         }
-    } catch (e) {
-        console.warn(`Feed 解析错误 ${feed.name}: ${e.message}`);
-        return [];
+        return parseAtom(root, feed, cutoffDate, sentUrls);
+    } catch (error) {
+        if (!isEntityLimitError(error)) throw error;
+
+        const sanitized = sanitizeXmlForParsing(xml);
+        try {
+            const doc = XmlService.parse(sanitized);
+            const root = doc.getRootElement();
+            if (root.getName().toLowerCase() === 'rss') {
+                return parseRss(root, feed, cutoffDate, sentUrls);
+            }
+            return parseAtom(root, feed, cutoffDate, sentUrls);
+        } catch (retryError) {
+            console.warn('XML 解析降级为正则 ' + feed.name + ': ' + retryError.message);
+            return parseFeedWithRegexFallback(sanitized, feed, cutoffDate, sentUrls);
+        }
     }
+}
+
+function isEntityLimitError(error) {
+    if (!error || !error.message) return false;
+    return error.message.indexOf('JAXP00010003') >= 0
+        || error.message.indexOf('length of entity') >= 0;
+}
+
+function sanitizeXmlForParsing(xml) {
+    if (!xml) return '';
+    return xml
+        .replace(/<!DOCTYPE[\s\S]*?\]>/gi, '')
+        .replace(/<!DOCTYPE[^>]*>/gi, '')
+        .replace(/<!ENTITY[\s\S]*?>/gi, '')
+        .replace(/&xml;/gi, '')
+        .replace(/<\?xml-stylesheet[\s\S]*?\?>/gi, '');
+}
+
+function parseFeedWithRegexFallback(xml, feed, cutoffDate, sentUrls) {
+    if (/<entry\b/i.test(xml)) return parseAtomByRegex(xml, feed, cutoffDate, sentUrls);
+    return parseRssByRegex(xml, feed, cutoffDate, sentUrls);
+}
+
+function parseRssByRegex(xml, feed, cutoffDate, sentUrls) {
+    const articles = [];
+    const items = xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
+
+    for (let i = 0; i < items.length; i++) {
+        if (articles.length >= CONFIG.MAX_ITEMS_PER_FEED) break;
+        const item = items[i];
+
+        const link = decodeXmlEntities(extractXmlTag(item, 'link'));
+        if (!link || sentUrls.has(link)) continue;
+
+        const pubDate = parseDate(decodeXmlEntities(extractXmlTag(item, 'pubDate')));
+        if (pubDate < cutoffDate) continue;
+
+        articles.push({
+            title: decodeXmlEntities(extractXmlTag(item, 'title')) || 'No Title',
+            link: link,
+            content: decodeXmlEntities(extractXmlTag(item, 'content:encoded'))
+                || decodeXmlEntities(extractXmlTag(item, 'description'))
+                || '',
+            pubDate: pubDate,
+            source: feed.name
+        });
+    }
+
+    return articles;
+}
+
+function parseAtomByRegex(xml, feed, cutoffDate, sentUrls) {
+    const articles = [];
+    const entries = xml.match(/<entry\b[\s\S]*?<\/entry>/gi) || [];
+
+    for (let i = 0; i < entries.length; i++) {
+        if (articles.length >= CONFIG.MAX_ITEMS_PER_FEED) break;
+        const entry = entries[i];
+
+        const link = decodeXmlEntities(extractAtomLink(entry));
+        if (!link || sentUrls.has(link)) continue;
+
+        const dateStr = decodeXmlEntities(extractXmlTag(entry, 'published'))
+            || decodeXmlEntities(extractXmlTag(entry, 'updated'));
+        const pubDate = parseDate(dateStr);
+        if (pubDate < cutoffDate) continue;
+
+        const content = decodeXmlEntities(extractXmlTag(entry, 'content'))
+            || decodeXmlEntities(extractXmlTag(entry, 'summary'))
+            || '';
+
+        articles.push({
+            title: decodeXmlEntities(extractXmlTag(entry, 'title')) || 'No Title',
+            link: link,
+            content: content,
+            pubDate: pubDate,
+            source: feed.name
+        });
+    }
+
+    return articles;
+}
+
+function extractAtomLink(entryXml) {
+    const altMatch = entryXml.match(/<link\b[^>]*rel=["']alternate["'][^>]*href=["']([^"']+)["'][^>]*\/?>/i)
+        || entryXml.match(/<link\b[^>]*href=["']([^"']+)["'][^>]*rel=["']alternate["'][^>]*\/?>/i);
+    if (altMatch) return altMatch[1];
+
+    const hrefMatch = entryXml.match(/<link\b[^>]*href=["']([^"']+)["'][^>]*\/?>/i);
+    return hrefMatch ? hrefMatch[1] : '';
+}
+
+function extractXmlTag(xml, tagName) {
+    const escapedTag = escapeRegex(tagName);
+    const regex = new RegExp('<' + escapedTag + '\\b[^>]*>([\\s\\S]*?)<\\/' + escapedTag + '>', 'i');
+    const match = xml.match(regex);
+    if (!match || !match[1]) return '';
+
+    return match[1]
+        .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, '$1')
+        .replace(/<[^>]+>/g, ' ')
+        .trim();
+}
+
+function escapeRegex(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function decodeXmlEntities(text) {
+    if (!text) return '';
+    return text
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&#(\d+);/g, function (match, num) {
+            const code = parseInt(num, 10);
+            return isNaN(code) ? match : String.fromCharCode(code);
+        })
+        .replace(/&#x([0-9a-fA-F]+);/g, function (match, hex) {
+            const code = parseInt(hex, 16);
+            return isNaN(code) ? match : String.fromCharCode(code);
+        })
+        .trim();
 }
 
 function parseRss(root, feed, cutoffDate, sentUrls) {
@@ -343,6 +646,8 @@ function parseRss(root, feed, cutoffDate, sentUrls) {
     const items = root.getChild('channel')?.getChildren('item') || [];
 
     for (const item of items) {
+        if (articles.length >= CONFIG.MAX_ITEMS_PER_FEED) break;
+
         const link = getChildText(item, 'link');
         if (!link || sentUrls.has(link)) continue;
 
@@ -366,6 +671,8 @@ function parseAtom(root, feed, cutoffDate, sentUrls) {
     const entries = root.getChildren('entry', ns);
 
     for (const entry of entries) {
+        if (articles.length >= CONFIG.MAX_ITEMS_PER_FEED) break;
+
         let link = '';
         const linkEls = entry.getChildren('link', ns);
         for (const l of linkEls) {
@@ -407,7 +714,8 @@ function getChildText(element, name) {
 }
 
 function parseDate(dateStr) {
-    return dateStr ? new Date(dateStr) : new Date(0);
+    const date = dateStr ? new Date(dateStr) : new Date(0);
+    return isNaN(date.getTime()) ? new Date(0) : date;
 }
 
 // ==================== 邮件发送 ====================
@@ -518,7 +826,8 @@ function getSentUrls(sheet) {
     const urls = new Set();
     const lastRow = sheet.getLastRow();
     if (lastRow > 1) {
-        const data = sheet.getRange(Math.max(2, lastRow - 500), 1, Math.min(lastRow - 1, 500), 1).getValues();
+        const count = Math.min(lastRow - 1, CONFIG.SENT_URL_LOOKBACK);
+        const data = sheet.getRange(Math.max(2, lastRow - count + 1), 1, count, 1).getValues();
         data.forEach(r => urls.add(r[0]));
     }
     return urls;
@@ -528,14 +837,21 @@ function recordSentArticle(sheet, article, titleZh) {
     sheet.appendRow([article.link, article.title, titleZh, article.source, new Date()]);
 }
 
-function isTimeoutApproaching(start) {
-    return (new Date().getTime() - start) > CONFIG.MAX_EXECUTION_TIME;
+function isTimeoutApproaching(start, reserveMs) {
+    const reserve = reserveMs || 0;
+    const hardLimit = CONFIG.MAX_EXECUTION_TIME - CONFIG.SAFETY_BUFFER_MS - reserve;
+    return (new Date().getTime() - start) >= hardLimit;
 }
 
 function setupTrigger() {
     ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
     ScriptApp.newTrigger('main').timeBased().everyHours(4).create();
     console.log('触发器已重置');
+}
+
+// 兼容旧触发器函数名，避免 monitorNewFiles 继续执行旧逻辑
+function monitorNewFiles() {
+    main();
 }
 
 function testOptimizedWorkflow() {
