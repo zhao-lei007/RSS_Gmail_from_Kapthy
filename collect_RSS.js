@@ -140,6 +140,8 @@ const RSS_FEEDS = [
     { name: "mjg59.dreamwidth.org", url: "https://mjg59.dreamwidth.org/data/rss" },
     { name: "computer.rip", url: "https://computer.rip/rss.xml" },
     { name: "tedunangst.com", url: "https://www.tedunangst.com/flak/rss" },
+    { name: "steipete.me", url: "https://steipete.me/rss.xml" },
+    { name: "blog.sshh.io", url: "https://blog.sshh.io/feed" },
 ];
 
 // ==================== 主函数 ====================
