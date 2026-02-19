@@ -11,7 +11,7 @@
 const CONFIG = {
     SCRIPT_VERSION: '2026-02-09.6',
     EMAIL: 'zhaolei28007@gmail.com',
-    GEMINI_API_KEY: 'AIzaSyDUzzdav4PZRms3KCwTN-vod1DsOqHd9wM', // 已保留你的 Key
+    GEMINI_API_KEY: 'Your API', // 已保留你的 Key
     // 使用更稳定的 Flash 模型版本
     GEMINI_API_ENDPOINT: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent',
 
